@@ -1,9 +1,9 @@
 use crate::error::{Error, Result};
-use crate::raw;
 use crate::Uffd;
-use libc::c_void;
+use rustix::io::{UffdEvent, UffdMsg, UffdPagefaultFlags};
 #[cfg(linux4_14)]
-use nix::unistd::Pid;
+use rustix::process::Pid;
+use std::ffi::c_void;
 use std::os::unix::io::{FromRawFd, RawFd};
 
 /// Whether a page fault event was for a read or write.
@@ -78,9 +78,9 @@ pub enum Event {
 }
 
 impl Event {
-    pub(crate) fn from_uffd_msg(msg: &raw::uffd_msg) -> Result<Event> {
-        match msg.event {
-            raw::UFFD_EVENT_PAGEFAULT => {
+    pub(crate) fn from_uffd_msg(msg: &UffdMsg) -> Result<Event> {
+        match UffdEvent::from_raw(msg.event) {
+            Some(UffdEvent::Pagefault) => {
                 let pagefault = unsafe { msg.arg.pagefault };
                 cfg_if::cfg_if!(
                     if #[cfg(feature = "linux5_7")] {
@@ -94,7 +94,9 @@ impl Event {
                     }
                 );
 
-                let rw = if pagefault.flags & raw::UFFD_PAGEFAULT_FLAG_WRITE == 0 {
+                let rw = if !UffdPagefaultFlags::from_bits_truncate(pagefault.flags)
+                    .contains(UffdPagefaultFlags::WRITE)
+                {
                     ReadWrite::Read
                 } else {
                     ReadWrite::Write
@@ -109,13 +111,13 @@ impl Event {
                     thread_id,
                 })
             }
-            raw::UFFD_EVENT_FORK => {
+            Some(UffdEvent::Fork) => {
                 let fork = unsafe { msg.arg.fork };
                 Ok(Event::Fork {
                     uffd: unsafe { Uffd::from_raw_fd(fork.ufd as RawFd) },
                 })
             }
-            raw::UFFD_EVENT_REMAP => {
+            Some(UffdEvent::Remap) => {
                 let remap = unsafe { msg.arg.remap };
                 Ok(Event::Remap {
                     from: remap.from as *mut c_void,
@@ -123,21 +125,21 @@ impl Event {
                     len: remap.len as usize,
                 })
             }
-            raw::UFFD_EVENT_REMOVE => {
+            Some(UffdEvent::Remove) => {
                 let remove = unsafe { msg.arg.remove };
                 Ok(Event::Remove {
                     start: remove.start as *mut c_void,
                     end: remove.end as *mut c_void,
                 })
             }
-            raw::UFFD_EVENT_UNMAP => {
+            Some(UffdEvent::Unmap) => {
                 let remove = unsafe { msg.arg.remove };
                 Ok(Event::Unmap {
                     start: remove.start as *mut c_void,
                     end: remove.end as *mut c_void,
                 })
             }
-            _ => Err(Error::UnrecognizedEvent(msg.event)),
+            None => Err(Error::UnrecognizedEvent(msg.event)),
         }
     }
 }

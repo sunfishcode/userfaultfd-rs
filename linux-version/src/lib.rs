@@ -17,7 +17,7 @@ pub fn linux_headers_version() -> Version {
 ///
 /// This treats everything after the `major.minor.patch` triple as build metadata.
 pub fn linux_kernel_version() -> Result<Version, SemVerError> {
-    let uname = nix::sys::utsname::uname();
+    let uname = rustix::process::uname();
     let pre_ver = Version::parse(uname.release())?;
     Ok(Version {
         pre: vec![],

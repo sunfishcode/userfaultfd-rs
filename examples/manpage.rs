@@ -1,26 +1,22 @@
 //! Port of the example from the `userfaultfd` manpage.
-use libc::{self, c_void};
-use nix::poll::{poll, PollFd, PollFlags};
-use nix::sys::mman::{mmap, MapFlags, ProtFlags};
-use nix::unistd::{sysconf, SysconfVar};
+use rustix::fd::{AsRawFd, BorrowedFd};
+use rustix::io::{MapFlags, PollFd, PollFlags, ProtFlags};
 use std::env;
-use std::os::unix::io::AsRawFd;
+use std::ffi::c_void;
 use std::ptr;
 use userfaultfd::{Event, Uffd, UffdBuilder};
 
 fn fault_handler_thread(uffd: Uffd) {
-    let page_size = sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as usize;
+    let page_size = rustix::process::page_size();
 
     // Create a page that will be copied into the faulting region
 
     let page = unsafe {
-        mmap(
+        rustix::io::mmap_anonymous(
             ptr::null_mut(),
             page_size,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::PRIVATE,
         )
         .expect("mmap")
     };
@@ -31,16 +27,17 @@ fn fault_handler_thread(uffd: Uffd) {
     loop {
         // See what poll() tells us about the userfaultfd
 
-        let pollfd = PollFd::new(uffd.as_raw_fd(), PollFlags::POLLIN);
-        let nready = poll(&mut [pollfd], -1).expect("poll");
+        let fd = unsafe { BorrowedFd::borrow_raw_fd(uffd.as_raw_fd()) };
+        let mut pollfd = [PollFd::new(&fd, PollFlags::IN)];
+        let nready = rustix::io::poll(&mut pollfd, -1).expect("poll");
 
         println!("\nfault_handler_thread():");
-        let revents = pollfd.revents().unwrap();
+        let revents = pollfd[0].revents();
         println!(
             "    poll() returns: nready = {}; POLLIN = {}; POLLERR = {}",
             nready,
-            revents.contains(PollFlags::POLLIN),
-            revents.contains(PollFlags::POLLERR),
+            revents.contains(PollFlags::IN),
+            revents.contains(PollFlags::ERR),
         );
 
         // Read an event from the userfaultfd
@@ -81,7 +78,7 @@ fn main() {
         .parse::<usize>()
         .unwrap();
 
-    let page_size = sysconf(SysconfVar::PAGE_SIZE).unwrap().unwrap() as usize;
+    let page_size = rustix::process::page_size();
     let len = num_pages * page_size;
 
     // Create and enable userfaultfd object
@@ -97,13 +94,11 @@ fn main() {
     // allocated. When we actually touch the memory, it will be allocated via the userfaultfd.
 
     let addr = unsafe {
-        mmap(
+        rustix::io::mmap_anonymous(
             ptr::null_mut(),
             len,
-            ProtFlags::PROT_READ | ProtFlags::PROT_WRITE,
-            MapFlags::MAP_PRIVATE | MapFlags::MAP_ANONYMOUS,
-            -1,
-            0,
+            ProtFlags::READ | ProtFlags::WRITE,
+            MapFlags::PRIVATE,
         )
         .expect("mmap")
     };

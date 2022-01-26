@@ -1,36 +1,35 @@
 use crate::error::{Error, Result};
-use crate::raw;
 use crate::{IoctlFlags, Uffd};
 use bitflags::bitflags;
-use nix::errno::Errno;
+use rustix::io::{ioctl_uffdio_api, UffdFeatureFlags, UffdioApi, UserfaultfdFlags};
 
 cfg_if::cfg_if! {
     if #[cfg(any(feature = "linux5_7", feature = "linux4_14"))] {
         bitflags! {
             /// Used with `UffdBuilder` to determine which features are available in the current kernel.
             pub struct FeatureFlags: u64 {
-                const PAGEFAULT_FLAG_WP = raw::UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-                const EVENT_FORK = raw::UFFD_FEATURE_EVENT_FORK;
-                const EVENT_REMAP = raw::UFFD_FEATURE_EVENT_REMAP;
-                const EVENT_REMOVE = raw::UFFD_FEATURE_EVENT_REMOVE;
-                const MISSING_HUGETLBFS = raw::UFFD_FEATURE_MISSING_HUGETLBFS;
-                const MISSING_SHMEM = raw::UFFD_FEATURE_MISSING_SHMEM;
-                const EVENT_UNMAP = raw::UFFD_FEATURE_EVENT_UNMAP;
-                const SIGBUS = raw::UFFD_FEATURE_SIGBUS;
-                const THREAD_ID = raw::UFFD_FEATURE_THREAD_ID;
+                const PAGEFAULT_FLAG_WP = UffdFeatureFlags::PAGEFAULT_FLAG_WP.bits();
+                const EVENT_FORK = UffdFeatureFlags::EVENT_FORK.bits();
+                const EVENT_REMAP = UffdFeatureFlags::EVENT_REMAP.bits();
+                const EVENT_REMOVE = UffdFeatureFlags::EVENT_REMOVE.bits();
+                const MISSING_HUGETLBFS = UffdFeatureFlags::MISSING_HUGETLBFS.bits();
+                const MISSING_SHMEM = UffdFeatureFlags::MISSING_SHMEM.bits();
+                const EVENT_UNMAP = UffdFeatureFlags::EVENT_UNMAP.bits();
+                const SIGBUS = UffdFeatureFlags::SIGBUS.bits();
+                const THREAD_ID = UffdFeatureFlags::THREAD_ID.bits();
             }
         }
     } else {
         bitflags! {
             /// Used with `UffdBuilder` to determine which features are available in the current kernel.
             pub struct FeatureFlags: u64 {
-                const PAGEFAULT_FLAG_WP = raw::UFFD_FEATURE_PAGEFAULT_FLAG_WP;
-                const EVENT_FORK = raw::UFFD_FEATURE_EVENT_FORK;
-                const EVENT_REMAP = raw::UFFD_FEATURE_EVENT_REMAP;
-                const EVENT_REMOVE = raw::UFFD_FEATURE_EVENT_REMOVE;
-                const MISSING_HUGETLBFS = raw::UFFD_FEATURE_MISSING_HUGETLBFS;
-                const MISSING_SHMEM = raw::UFFD_FEATURE_MISSING_SHMEM;
-                const EVENT_UNMAP = raw::UFFD_FEATURE_EVENT_UNMAP;
+                const PAGEFAULT_FLAG_WP = UffdFeatureFlags::PAGEFAULT_FLAG_WP.bits();
+                const EVENT_FORK = UffdFeatureFlags::EVENT_FORK.bits();
+                const EVENT_REMAP = UffdFeatureFlags::EVENT_REMAP.bits();
+                const EVENT_REMOVE = UffdFeatureFlags::EVENT_REMOVE.bits();
+                const MISSING_HUGETLBFS = UffdFeatureFlags::MISSING_HUGETLBFS.bits();
+                const MISSING_SHMEM = UffdFeatureFlags::MISSING_SHMEM.bits();
+                const EVENT_UNMAP = UffdFeatureFlags::EVENT_UNMAP.bits();
             }
         }
     }
@@ -116,26 +115,26 @@ impl UffdBuilder {
     /// Create a `Uffd` object with the current settings of this builder.
     pub fn create(&self) -> Result<Uffd> {
         // first do the syscall to get the file descriptor
-        let mut flags = 0;
+        let mut flags = UserfaultfdFlags::empty();
         if self.close_on_exec {
-            flags |= libc::O_CLOEXEC;
+            flags |= UserfaultfdFlags::CLOEXEC;
         }
         if self.non_blocking {
-            flags |= libc::O_NONBLOCK;
+            flags |= UserfaultfdFlags::NONBLOCK;
         }
 
         if self.user_mode_only {
-            flags |= raw::UFFD_USER_MODE_ONLY as i32;
+            flags |= UserfaultfdFlags::USER_MODE_ONLY;
         }
 
-        let fd = match Errno::result(unsafe { raw::userfaultfd(flags) }) {
+        let fd = match unsafe { rustix::io::userfaultfd(flags) } {
             Ok(fd) => fd,
             // setting the USER_MODE_ONLY flag on kernel pre-5.11 causes it to return EINVAL.
             // If the user asks for the flag, we first try with it set, and if kernel gives
             // EINVAL we try again without the flag set.
-            Err(Errno::EINVAL) if self.user_mode_only => Errno::result(unsafe {
-                raw::userfaultfd(flags & !raw::UFFD_USER_MODE_ONLY as i32)
-            })?,
+            Err(rustix::io::Error::INVAL) if self.user_mode_only => unsafe {
+                rustix::io::userfaultfd(flags & !UserfaultfdFlags::USER_MODE_ONLY)?
+            },
             Err(e) => return Err(e.into()),
         };
 
@@ -143,14 +142,12 @@ impl UffdBuilder {
         let uffd = Uffd { fd };
 
         // then do the UFFDIO_API ioctl to set up and ensure features and other ioctls are available
-        let mut api = raw::uffdio_api {
-            api: raw::UFFD_API,
+        let mut api = UffdioApi {
+            api: rustix::io::UFFD_API,
             features: self.req_features.bits(),
             ioctls: 0,
         };
-        unsafe {
-            raw::api(uffd.fd, &mut api as *mut raw::uffdio_api)?;
-        }
+        ioctl_uffdio_api(&uffd.fd, &mut api)?;
         let supported =
             IoctlFlags::from_bits(api.ioctls).ok_or(Error::UnrecognizedIoctls(api.ioctls))?;
         if !supported.contains(self.req_ioctls) {

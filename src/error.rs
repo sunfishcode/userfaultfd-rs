@@ -1,12 +1,11 @@
 use crate::IoctlFlags;
-use nix::errno::Errno;
 use thiserror::Error;
 
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Errors for this crate.
 ///
-/// Several of these errors contain an underlying `Errno` value; see
+/// Several of these errors contain an underlying `rustix::io::Error` value; see
 /// [`userfaultfd(2)`](http://man7.org/linux/man-pages/man2/userfaultfd.2.html) and
 /// [`ioctl_userfaultfd(2)`](http://man7.org/linux/man-pages/man2/ioctl_userfaultfd.2.html) for more
 /// details on how to interpret these errors.
@@ -14,7 +13,7 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     /// Copy ioctl failure with `errno` value.
     #[error("Copy failed")]
-    CopyFailed(Errno),
+    CopyFailed(rustix::io::Error),
 
     /// Failure to read a full `uffd_msg` struct from the underlying file descriptor.
     #[error("Incomplete uffd_msg; read only {read}/{expected} bytes")]
@@ -22,7 +21,7 @@ pub enum Error {
 
     /// Generic system error.
     #[error("System error")]
-    SystemError(#[source] nix::Error),
+    SystemError(#[source] rustix::io::Error),
 
     /// End-of-file was read from the underlying file descriptor.
     #[error("EOF when reading file descriptor")]
@@ -42,11 +41,11 @@ pub enum Error {
 
     /// Zeropage ioctl failure with `errno` value.
     #[error("Zeropage failed: {0}")]
-    ZeropageFailed(Errno),
+    ZeropageFailed(rustix::io::Error),
 }
 
-impl From<nix::Error> for Error {
-    fn from(e: nix::Error) -> Error {
+impl From<rustix::io::Error> for Error {
+    fn from(e: rustix::io::Error) -> Error {
         Error::SystemError(e)
     }
 }

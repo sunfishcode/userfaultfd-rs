@@ -10,23 +10,28 @@
 mod builder;
 mod error;
 mod event;
-mod raw;
 
 pub use crate::builder::{FeatureFlags, UffdBuilder};
 pub use crate::error::{Error, Result};
 pub use crate::event::{Event, FaultKind, ReadWrite};
 
 use bitflags::bitflags;
-use libc::{self, c_void};
-use nix::errno::Errno;
-use nix::unistd::read;
+#[cfg(feature = "linux5_7")]
+use rustix::io::UffdioWriteprotect;
+use rustix::io::{
+    ioctl_uffdio_copy, ioctl_uffdio_register, ioctl_uffdio_unregister, ioctl_uffdio_wake,
+    ioctl_uffdio_zeropage, read, OwnedFd, UffdMsg, UffdioCopy, UffdioCopyModeFlags,
+    UffdioIoctlFlags, UffdioRange, UffdioRegister, UffdioRegisterModeFlags, UffdioZeropage,
+    UffdioZeropageModeFlags,
+};
+use std::ffi::c_void;
 use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 
 /// Represents an opaque buffer where userfaultfd events are stored.
 ///
 /// This is used in conjunction with [`Uffd::read_events`].
-pub struct EventBuffer(Vec<raw::uffd_msg>);
+pub struct EventBuffer(Vec<UffdMsg>);
 
 impl EventBuffer {
     /// Creates a new buffer for `size` number of events.
@@ -44,30 +49,26 @@ impl EventBuffer {
 /// essential for using functions like `poll` on a worker thread.
 #[derive(Debug)]
 pub struct Uffd {
-    fd: RawFd,
-}
-
-impl Drop for Uffd {
-    fn drop(&mut self) {
-        unsafe { libc::close(self.fd) };
-    }
+    fd: OwnedFd,
 }
 
 impl AsRawFd for Uffd {
     fn as_raw_fd(&self) -> RawFd {
-        self.fd
+        self.fd.as_raw_fd()
     }
 }
 
 impl IntoRawFd for Uffd {
     fn into_raw_fd(self) -> RawFd {
-        self.fd
+        self.fd.into_raw_fd()
     }
 }
 
 impl FromRawFd for Uffd {
     unsafe fn from_raw_fd(fd: RawFd) -> Self {
-        Uffd { fd }
+        Uffd {
+            fd: FromRawFd::from_raw_fd(fd),
+        }
     }
 }
 
@@ -75,10 +76,10 @@ bitflags! {
     /// The registration mode used when registering an address range with `Uffd`.
     pub struct RegisterMode: u64 {
         /// Registers the range for missing page faults.
-        const MISSING = raw::UFFDIO_REGISTER_MODE_MISSING;
+        const MISSING = UffdioRegisterModeFlags::MISSING.bits();
         /// Registers the range for write faults.
         #[cfg(feature = "linux5_7")]
-        const WRITE_PROTECT = raw::UFFDIO_REGISTER_MODE_WP;
+        const WRITE_PROTECT = UffdioRegisterModeFlags::WP.bits();
     }
 }
 
@@ -99,29 +100,25 @@ impl Uffd {
         len: usize,
         mode: RegisterMode,
     ) -> Result<IoctlFlags> {
-        let mut register = raw::uffdio_register {
-            range: raw::uffdio_range {
+        let mut register = UffdioRegister {
+            range: UffdioRange {
                 start: start as u64,
                 len: len as u64,
             },
             mode: mode.bits(),
             ioctls: 0,
         };
-        unsafe {
-            raw::register(self.as_raw_fd(), &mut register as *mut raw::uffdio_register)?;
-        }
+        ioctl_uffdio_register(&self.fd, &mut register)?;
         IoctlFlags::from_bits(register.ioctls).ok_or(Error::UnrecognizedIoctls(register.ioctls))
     }
 
     /// Unregister a memory address range from the userfaultfd object.
     pub fn unregister(&self, start: *mut c_void, len: usize) -> Result<()> {
-        let mut range = raw::uffdio_range {
+        let mut range = UffdioRange {
             start: start as u64,
             len: len as u64,
         };
-        unsafe {
-            raw::unregister(self.as_raw_fd(), &mut range as *mut raw::uffdio_range)?;
-        }
+        ioctl_uffdio_unregister(&self.fd, &mut range)?;
         Ok(())
     }
 
@@ -137,23 +134,24 @@ impl Uffd {
         len: usize,
         wake: bool,
     ) -> Result<usize> {
-        let mut copy = raw::uffdio_copy {
+        let mut copy = UffdioCopy {
             src: src as u64,
             dst: dst as u64,
             len: len as u64,
             mode: if wake {
                 0
             } else {
-                raw::UFFDIO_COPY_MODE_DONTWAKE
+                UffdioCopyModeFlags::DONTWAKE.bits()
             },
             copy: 0,
         };
 
-        let _ = raw::copy(self.as_raw_fd(), &mut copy as *mut raw::uffdio_copy)
-            .map_err(Error::CopyFailed)?;
+        let _ = ioctl_uffdio_copy(&self.fd, &mut copy).map_err(Error::CopyFailed)?;
         if copy.copy < 0 {
             // shouldn't ever get here, as errno should be caught above
-            Err(Error::CopyFailed(Errno::from_i32(-copy.copy as i32)))
+            Err(Error::CopyFailed(rustix::io::Error::from_raw_os_error(
+                -copy.copy as i32,
+            )))
         } else {
             Ok(copy.copy as usize)
         }
@@ -165,24 +163,24 @@ impl Uffd {
     /// If `wake` is `true`, wake up the thread waiting for page fault resolution on the memory
     /// address range.
     pub unsafe fn zeropage(&self, start: *mut c_void, len: usize, wake: bool) -> Result<usize> {
-        let mut zeropage = raw::uffdio_zeropage {
-            range: raw::uffdio_range {
+        let mut zeropage = UffdioZeropage {
+            range: UffdioRange {
                 start: start as u64,
                 len: len as u64,
             },
             mode: if wake {
-                0
+                UffdioZeropageModeFlags::empty()
             } else {
-                raw::UFFDIO_ZEROPAGE_MODE_DONTWAKE
-            },
+                UffdioZeropageModeFlags::DONTWAKE
+            }
+            .bits(),
             zeropage: 0,
         };
 
-        let _ = raw::zeropage(self.as_raw_fd(), &mut zeropage as &mut raw::uffdio_zeropage)
-            .map_err(Error::ZeropageFailed)?;
+        let _ = ioctl_uffdio_zeropage(&self.fd, &mut zeropage).map_err(Error::ZeropageFailed)?;
         if zeropage.zeropage < 0 {
             // shouldn't ever get here, as errno should be caught above
-            Err(Error::ZeropageFailed(Errno::from_i32(
+            Err(Error::ZeropageFailed(rustix::io::Error::from_raw_os_error(
                 -zeropage.zeropage as i32,
             )))
         } else {
@@ -192,33 +190,26 @@ impl Uffd {
 
     /// Wake up the thread waiting for page fault resolution on the specified memory address range.
     pub fn wake(&self, start: *mut c_void, len: usize) -> Result<()> {
-        let mut range = raw::uffdio_range {
+        let mut range = UffdioRange {
             start: start as u64,
             len: len as u64,
         };
-        unsafe {
-            raw::wake(self.as_raw_fd(), &mut range as *mut raw::uffdio_range)?;
-        }
+        ioctl_uffdio_wake(&self.fd, &mut range)?;
         Ok(())
     }
 
     /// Makes a range write-protected.
     #[cfg(feature = "linux5_7")]
     pub fn write_protect(&self, start: *mut c_void, len: usize) -> Result<()> {
-        let mut ioctl = raw::uffdio_writeprotect {
-            range: raw::uffdio_range {
+        let mut ioctl = UffdioWriteprotect {
+            range: UffdioRange {
                 start: start as u64,
                 len: len as u64,
             },
             mode: raw::UFFDIO_WRITEPROTECT_MODE_WP,
         };
 
-        unsafe {
-            raw::write_protect(
-                self.as_raw_fd(),
-                &mut ioctl as *mut raw::uffdio_writeprotect,
-            )?;
-        }
+        ioctl_uffdio_writeprotect(self, &mut ioctl)?;
 
         Ok(())
     }
@@ -234,8 +225,8 @@ impl Uffd {
         len: usize,
         wake: bool,
     ) -> Result<()> {
-        let mut ioctl = raw::uffdio_writeprotect {
-            range: raw::uffdio_range {
+        let mut ioctl = UffdioWriteprotect {
+            range: UffdioRange {
                 start: start as u64,
                 len: len as u64,
             },
@@ -247,10 +238,7 @@ impl Uffd {
         };
 
         unsafe {
-            raw::write_protect(
-                self.as_raw_fd(),
-                &mut ioctl as *mut raw::uffdio_writeprotect,
-            )?;
+            raw::write_protect(self.as_raw_fd(), &mut ioctl)?;
         }
 
         Ok(())
@@ -323,16 +311,16 @@ impl Uffd {
 
     fn read<'a>(
         &self,
-        msgs: &'a mut [raw::uffd_msg],
+        msgs: &'a mut [UffdMsg],
     ) -> Result<impl Iterator<Item = Result<Event>> + 'a> {
-        const MSG_SIZE: usize = std::mem::size_of::<raw::uffd_msg>();
+        const MSG_SIZE: usize = std::mem::size_of::<UffdMsg>();
 
         let buf = unsafe {
             std::slice::from_raw_parts_mut(msgs.as_mut_ptr() as _, msgs.len() * MSG_SIZE)
         };
 
-        let count = match read(self.as_raw_fd(), buf) {
-            Err(e) if e == Errno::EAGAIN => 0,
+        let count = match read(&self.fd, buf) {
+            Err(rustix::io::Error::AGAIN) => 0,
             Err(e) => return Err(Error::SystemError(e)),
             Ok(0) => return Err(Error::ReadEof),
             Ok(bytes_read) => {
@@ -355,20 +343,21 @@ impl Uffd {
 bitflags! {
     /// Used with `UffdBuilder` and `Uffd::register()` to determine which operations are available.
     pub struct IoctlFlags: u64 {
-        const REGISTER = 1 << raw::_UFFDIO_REGISTER;
-        const UNREGISTER = 1 << raw::_UFFDIO_UNREGISTER;
-        const WAKE = 1 << raw::_UFFDIO_WAKE;
-        const COPY = 1 << raw::_UFFDIO_COPY;
-        const ZEROPAGE = 1 << raw::_UFFDIO_ZEROPAGE;
+        const REGISTER =  UffdioIoctlFlags::REGISTER.bits();
+        const UNREGISTER =  UffdioIoctlFlags::UNREGISTER.bits();
+        const WAKE =  UffdioIoctlFlags::WAKE.bits();
+        const COPY =  UffdioIoctlFlags::COPY.bits();
+        const ZEROPAGE =  UffdioIoctlFlags::ZEROPAGE.bits();
         #[cfg(feature = "linux5_7")]
-        const WRITE_PROTECT = 1 << raw::_UFFDIO_WRITEPROTECT;
-        const API = 1 << raw::_UFFDIO_API;
+        const WRITE_PROTECT =  UffdioIoctlFlags::WRITEPROTECT.bits();
+        const API =  UffdioIoctlFlags::API.bits();
     }
 }
 
 #[cfg(test)]
 mod test {
     use super::*;
+    use rustix::io::{MapFlags, ProtFlags};
     use std::ptr;
     use std::thread;
 
@@ -379,14 +368,13 @@ mod test {
         unsafe {
             let uffd = UffdBuilder::new().close_on_exec(true).create()?;
 
-            let mapping = libc::mmap(
+            let mapping = rustix::io::mmap_anonymous(
                 ptr::null_mut(),
                 PAGE_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+            .unwrap();
 
             assert!(!mapping.is_null());
 
@@ -414,7 +402,7 @@ mod test {
 
             uffd.unregister(mapping, PAGE_SIZE)?;
 
-            assert_eq!(libc::munmap(mapping, PAGE_SIZE), 0);
+            rustix::io::munmap(mapping, PAGE_SIZE).unwrap();
         }
 
         Ok(())
@@ -430,14 +418,13 @@ mod test {
                 .non_blocking(true)
                 .create()?;
 
-            let mapping = libc::mmap(
+            let mapping = rustix::io::mmap_anonymous(
                 ptr::null_mut(),
                 PAGE_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+            .unwrap();
 
             assert!(!mapping.is_null());
 
@@ -471,7 +458,7 @@ mod test {
 
             uffd.unregister(mapping, PAGE_SIZE)?;
 
-            assert_eq!(libc::munmap(mapping, PAGE_SIZE), 0);
+            rustix::io::munmap(mapping, PAGE_SIZE).unwrap();
         }
 
         Ok(())
@@ -486,14 +473,13 @@ mod test {
 
             let uffd = UffdBuilder::new().close_on_exec(true).create()?;
 
-            let mapping = libc::mmap(
+            let mapping = rustix::io::mmap_anonymous(
                 ptr::null_mut(),
                 MEM_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
-            );
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
+            )
+            .unwrap();
 
             assert!(!mapping.is_null());
 
@@ -563,7 +549,7 @@ mod test {
 
             uffd.unregister(mapping, MEM_SIZE)?;
 
-            assert_eq!(libc::munmap(mapping, MEM_SIZE), 0);
+            rustix::io::munmap(mapping, MEM_SIZE).unwrap();
         }
 
         Ok(())
@@ -580,13 +566,11 @@ mod test {
                 .close_on_exec(true)
                 .create()?;
 
-            let mapping = libc::mmap(
+            let mapping = rustix::io::mmap_anonymous(
                 ptr::null_mut(),
                 PAGE_SIZE,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_PRIVATE | libc::MAP_ANON,
-                -1,
-                0,
+                ProtFlags::READ | ProtFlags::WRITE,
+                MapFlags::PRIVATE,
             );
 
             assert!(!mapping.is_null());
@@ -651,7 +635,7 @@ mod test {
 
             uffd.unregister(mapping, PAGE_SIZE)?;
 
-            assert_eq!(libc::munmap(mapping, PAGE_SIZE), 0);
+            rustix::io::munmap(mapping, PAGE_SIZE).unwrap();
         }
 
         Ok(())

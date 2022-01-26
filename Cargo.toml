@@ -11,12 +11,10 @@ readme = "README.md"
 [dependencies]
 bitflags = "1.0"
 cfg-if = "^1.0.0"
-libc = "0.2.65"
-nix = "0.23"
+rustix = { path = "../rustix" }
 thiserror = "1.0.4"
-userfaultfd-sys = { path = "userfaultfd-sys", version = "^0.4.0" }
 
 [features]
 default = []
-linux4_14 = ["userfaultfd-sys/linux4_14"]
-linux5_7 = ["userfaultfd-sys/linux5_7"]
+linux4_14 = []
+linux5_7 = []
